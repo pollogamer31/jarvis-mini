@@ -25,6 +25,11 @@ import threading
 import subprocess
 import json
 import urllib.request
+import urllib.error
+import urllib.parse
+import ast
+import operator
+from pathlib import Path
 
 from rich.console import Console
 from rich.panel import Panel
@@ -42,13 +47,30 @@ console = Console()
 NOME_ASSISTENTE = "JARVIS"
 NOME_UTENTE = "Lore"
 
-FILE_LOG = "jarvis_log.txt"
-FILE_COMPITI = "compiti.txt"
-FILE_SCADENZE = "scadenze.txt"
+# I dati restano sempre accanto allo script, anche se Jarvis viene avviato da
+# un'altra cartella del Terminale.
+CARTELLA_JARVIS = Path(__file__).resolve().parent
+FILE_LOG = CARTELLA_JARVIS / "jarvis_log.txt"
+FILE_COMPITI = CARTELLA_JARVIS / "compiti.txt"
+FILE_SCADENZE = CARTELLA_JARVIS / "scadenze.txt"
+FILE_PREFERENZE = CARTELLA_JARVIS / "jarvis_preferences.json"
 
 # se il log supera questa lunghezza, viene "tagliato" tenendo solo le righe più recenti
 LIMITE_RIGHE_LOG = 500
 RIGHE_LOG_DA_TENERE = 200
+
+# Le chat possono contenere informazioni personali: il log conserva i comandi
+# normali, ma non il loro contenuto. Modifica questa opzione solo se desideri
+# esplicitamente registrare anche le conversazioni con l'AI.
+REGISTRA_CONTENUTO_CHAT = False
+
+# Mantiene le richieste a Ollama rapide e dentro il contesto del modello.
+MAX_MESSAGGI_CHAT = 20
+MAX_MINUTI_POMODORO = 240
+MAX_RISULTATO_CALCOLO = 10 ** 12
+
+# Lingua dell'interfaccia. Viene scelta una sola volta al primo avvio.
+LINGUA = "it"
 
 SUONO_AVVISO = "/System/Library/Sounds/Glass.aiff"
 
@@ -66,37 +88,6 @@ THREAD_STUDIO = None
 # variabili globali per la modalità chat con l'AI
 MODALITA_CHAT_ATTIVA = False
 CRONOLOGIA_CHAT = []
-
-DISCOGRAFIA = [
-    ("Gli occhi della tigre", "Nayt"),
-    ("Come un film", "Nayt"),
-    ("Habitat", "Nayt"),
-    ("Lasciami stare", "Nayt"),
-    ("Immortale", "Nayt"),
-    ("Da zero", "Nayt"),
-    ("Il ragazzo d'oro", "Guè"),
-    ("Bravo ragazzo", "Guè"),
-    ("Chico", "Guè"),
-    ("Veleno", "Guè"),
-    ("Piango Sulla Lambo", "Guè"),
-    ("Spacco tutto", "Guè (Club Dogo)"),
-    ("Ventidue", "22Simba"),
-    ("Per i Roiz", "22Simba"),
-    ("Spoiler", "22Simba"),
-    ("Stare Bene", "22Simba"),
-    ("Speranza", "22Simba"),
-    ("King del Rap", "Marracash"),
-    ("Badabum Cha Cha", "Marracash"),
-    ("Crudelia - I nervi", "Marracash"),
-    ("15 piani", "Marracash"),
-    ("Bravi a cadere", "Marracash"),
-    ("Grammelot", "Kid Yugi"),
-    ("Sturm und Drang", "Kid Yugi"),
-    ("Il Filmografo", "Kid Yugi"),
-    ("Il ferro di Čechov", "Kid Yugi"),
-    ("Sintetico", "Kid Yugi"),
-    ("Berserker", "Kid Yugi"),
-]
 
 SITI_RAPIDI = {
     "youtube": "https://youtube.com",
@@ -120,13 +111,73 @@ BANNER_ASCII = [
 COLORI_BANNER = ["blue3", "dodger_blue2", "deep_sky_blue1", "cyan2", "bright_cyan", "white"]
 
 
+def t(italiano, inglese):
+    """Restituisce il testo dell'interfaccia nella lingua selezionata."""
+    return inglese if LINGUA == "en" else italiano
+
+
+def scegli_lingua():
+    """Carica la lingua salvata o la chiede soltanto al primo avvio."""
+    global LINGUA
+    try:
+        if FILE_PREFERENZE.exists():
+            dati = json.loads(FILE_PREFERENZE.read_text(encoding="utf-8"))
+            if dati.get("language") in ("it", "en"):
+                LINGUA = dati["language"]
+                return
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    console.print("[bold cyan]Benvenuto / Welcome![/]")
+    console.print("Scegli la lingua di Jarvis. Questa scelta verrà ricordata.")
+    console.print("Choose Jarvis's language. This choice will be remembered.")
+    while True:
+        scelta = console.input("[bold yellow]Italiano o English? [it/en]: [/]").strip().lower()
+        if scelta in ("it", "italiano", "italian"):
+            LINGUA = "it"
+            break
+        if scelta in ("en", "english", "inglese"):
+            LINGUA = "en"
+            break
+        console.print("[red]Scrivi 'it' oppure 'en' / Type 'it' or 'en'.[/]")
+
+    try:
+        FILE_PREFERENZE.write_text(json.dumps({"language": LINGUA}), encoding="utf-8")
+    except OSError:
+        console.print(t("[yellow]Non riesco a salvare la scelta della lingua.[/]", "[yellow]I couldn't save your language choice.[/]"))
+
+
+def normalizza_comando_inglese(comando):
+    """Accetta le controparti inglesi dei comandi senza modificare gli argomenti."""
+    if LINGUA != "en":
+        return comando
+    equivalenze = (
+        ("stop study", "stop studio"), ("tasks list", "compiti lista"),
+        ("tasks add", "compiti aggiungi"), ("tasks done", "compiti fatto"),
+        ("deadlines list", "scadenza lista"), ("deadlines add", "scadenza aggiungi"),
+        ("deadlines done", "scadenza fatto"), ("deadline list", "scadenza lista"),
+        ("deadline add", "scadenza aggiungi"), ("deadline done", "scadenza fatto"),
+        ("stop study", "stop studio"), ("open", "apri"), ("calculate", "calcola"),
+        ("time", "ora"), ("tasks", "compiti"), ("deadlines", "scadenza"),
+        ("deadline", "scadenza"), ("next", "prossima"), ("study", "studio"),
+        ("ask", "chiedi"), ("translate", "traduci"), ("dice", "dado"),
+        ("coin", "moneta"), ("battery", "batteria"), ("status", "stato"),
+        ("help", "aiuto"), ("quit", "esci"), ("exit", "esci"),
+    )
+    minuscolo = comando.lower()
+    for inglese, italiano in equivalenze:
+        if minuscolo == inglese or minuscolo.startswith(inglese + " "):
+            return italiano + comando[len(inglese):]
+    return comando
+
+
 def mostra_banner():
     for riga, colore in zip(BANNER_ASCII, COLORI_BANNER):
         for carattere in riga:
             console.print(carattere, end="", style=f"bold {colore}")
             time.sleep(0.0015)
         console.print()
-    console.print("[dim italic]        >> assistente personale di Lore <<[/]\n")
+    console.print(t("[dim italic]        >> assistente personale di Lore <<[/]\n", "[dim italic]        >> Lore's personal assistant <<[/]\n"))
 
 
 # ---------------------------------------------------------
@@ -136,57 +187,87 @@ def mostra_banner():
 def saluta():
     ora = datetime.datetime.now().hour
     if ora < 6:
-        momento = "Sei sveglio a quest'ora?"
+        momento = t("Sei sveglio a quest'ora?", "You're awake at this hour?")
     elif ora < 13:
-        momento = "Buongiorno"
+        momento = t("Buongiorno", "Good morning")
     elif ora < 18:
-        momento = "Buon pomeriggio"
+        momento = t("Buon pomeriggio", "Good afternoon")
     else:
-        momento = "Buonasera"
-    console.print(f"[bold cyan]{momento}, {NOME_UTENTE}.[/] Sono {NOME_ASSISTENTE}, dimmi pure.")
+        momento = t("Buonasera", "Good evening")
+    finale = t("dimmi pure.", "how can I help?")
+    console.print(f"[bold cyan]{momento}, {NOME_UTENTE}.[/] {t('Sono', 'I am')} {NOME_ASSISTENTE}, {finale}")
 
 
 def dimmi_ora():
     adesso = datetime.datetime.now()
-    console.print(f"[green]Sono le {adesso.strftime('%H:%M')} di {adesso.strftime('%A %d %B %Y')}[/]")
+    if LINGUA == "en":
+        console.print(f"[green]It is {adesso.strftime('%H:%M')} on {adesso.strftime('%A, %B %d, %Y')}.[/]")
+    else:
+        console.print(f"[green]Sono le {adesso.strftime('%H:%M')} di {adesso.strftime('%A %d %B %Y')}[/]")
 
 
 def apri_sito(comando):
     parole = comando.split()
     if len(parole) < 2:
-        console.print("[red]Dimmi quale sito, tipo: apri youtube[/]")
+        console.print(t("[red]Dimmi quale sito, tipo: apri youtube[/]", "[red]Tell me which site, e.g. open youtube[/]"))
         return
-    nome = parole[1].lower()
-    if nome in SITI_RAPIDI:
-        console.print(f"[cyan]Apro {nome}...[/]")
-        webbrowser.open(SITI_RAPIDI[nome])
+    nome = " ".join(parole[1:])
+    if nome.lower() in SITI_RAPIDI:
+        console.print(t(f"[cyan]Apro {nome}...[/]", f"[cyan]Opening {nome}...[/]"))
+        webbrowser.open(SITI_RAPIDI[nome.lower()])
     else:
-        console.print(f"[yellow]Non conosco '{nome}', provo a cercarlo su Google...[/]")
-        webbrowser.open(f"https://www.google.com/search?q={nome}")
+        console.print(t(f"[yellow]Non conosco '{nome}', provo a cercarlo su Google...[/]", f"[yellow]I don't know '{nome}', searching Google...[/]"))
+        query = urllib.parse.quote_plus(nome)
+        webbrowser.open(f"https://www.google.com/search?q={query}")
 
 
 def calcolatrice(comando):
-    espressione = comando.replace("calcola", "", 1).strip()
+    espressione = comando.split(maxsplit=1)[1].strip() if len(comando.split(maxsplit=1)) > 1 else ""
     try:
-        caratteri_ammessi = set("0123456789+-*/(). ")
-        if not set(espressione) <= caratteri_ammessi:
-            raise ValueError
-        risultato = eval(espressione)
-        console.print(f"[green]Risultato: {risultato}[/]")
-    except Exception:
-        console.print("[red]Non ho capito il calcolo, scrivi tipo: calcola 4*7+2[/]")
+        risultato = valuta_espressione(espressione)
+        console.print(t(f"[green]Risultato: {risultato}[/]", f"[green]Result: {risultato}[/]"))
+    except (SyntaxError, ValueError, ZeroDivisionError, OverflowError):
+        console.print(t("[red]Non ho capito il calcolo, scrivi tipo: calcola 4*7+2[/]", "[red]I couldn't understand the calculation; try: calculate 4*7+2[/]"))
 
 
-def ascolta_random():
-    canzone, artista = random.choice(DISCOGRAFIA)
-    console.print(f"[magenta]🎧 Oggi ascolta: \"{canzone}\" di {artista}[/]")
+def valuta_espressione(espressione):
+    """Valuta solo semplici operazioni aritmetiche, senza eseguire codice."""
+    operatori = {
+        ast.Add: operator.add,
+        ast.Sub: operator.sub,
+        ast.Mult: operator.mul,
+        ast.Div: operator.truediv,
+        ast.FloorDiv: operator.floordiv,
+        ast.Mod: operator.mod,
+    }
+
+    def controlla_risultato(valore):
+        if type(valore) not in (int, float) or abs(valore) > MAX_RISULTATO_CALCOLO:
+            raise ValueError("Risultato non consentito")
+        return valore
+
+    def visita(nodo):
+        if isinstance(nodo, ast.Constant) and type(nodo.value) in (int, float):
+            return controlla_risultato(nodo.value)
+        if isinstance(nodo, ast.UnaryOp) and type(nodo.op) in (ast.UAdd, ast.USub):
+            valore = visita(nodo.operand)
+            return controlla_risultato(+valore if isinstance(nodo.op, ast.UAdd) else -valore)
+        if isinstance(nodo, ast.BinOp) and type(nodo.op) in operatori:
+            sinistra = visita(nodo.left)
+            destra = visita(nodo.right)
+            return controlla_risultato(operatori[type(nodo.op)](sinistra, destra))
+        raise ValueError("Espressione non consentita")
+
+    if not espressione:
+        raise ValueError("Espressione mancante")
+    return visita(ast.parse(espressione, mode="eval").body)
 
 
 def suona_beep():
     try:
-        os.system(f"afplay {SUONO_AVVISO}")
-    except Exception:
-        pass
+        subprocess.run(["afplay", SUONO_AVVISO], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        console.print(t("[yellow]Non riesco a riprodurre il suono di avviso.[/]", "[yellow]I couldn't play the alert sound.[/]"))
 
 
 def mostra_stato():
@@ -199,7 +280,11 @@ def mostra_stato():
         testo_durata = f"{secondi} secondi"
     else:
         testo_durata = f"{minuti} minuti e {secondi} secondi"
-    console.print(f"[cyan]Sono acceso da {testo_durata}.[/]")
+    if LINGUA == "en":
+        testo_durata = f"{minuti} minutes and {secondi} seconds" if minuti else f"{secondi} seconds"
+        console.print(f"[cyan]I've been running for {testo_durata}.[/]")
+    else:
+        console.print(f"[cyan]Sono acceso da {testo_durata}.[/]")
 
 
 def scrivi_nel_log(comando):
@@ -277,21 +362,21 @@ def avvisa_dopo(testo, secondi):
 def timer(comando):
     parole = comando.split()[1:]
     if not parole:
-        console.print("[red]Usa: timer 2 min 3 sec  (oppure con testo: timer controlla il forno 10 min)[/]")
+        console.print(t("[red]Usa: timer 2 min 3 sec  (oppure con testo: timer controlla il forno 10 min)[/]", "[red]Use: timer 2 min 3 sec (or with text: timer check the oven 10 min)[/]"))
         return
 
     secondi, testo = analizza_tempo(parole)
 
     if secondi is None or secondi <= 0:
-        console.print("[red]Formato non riconosciuto. Usa: timer 1 h 2 min 3 sec[/]")
+        console.print(t("[red]Formato non riconosciuto. Usa: timer 1 h 2 min 3 sec[/]", "[red]Format not recognised. Use: timer 1 h 2 min 3 sec[/]"))
         return
 
     messaggio_finale = testo if testo else "Tempo scaduto!"
 
     if testo:
-        console.print(f"[cyan]⏳ Timer impostato tra {formatta_durata(secondi)}: {testo}[/]")
+        console.print(t(f"[cyan]⏳ Timer impostato tra {formatta_durata(secondi)}: {testo}[/]", f"[cyan]⏳ Timer set for {formatta_durata(secondi)}: {testo}[/]"))
     else:
-        console.print(f"[cyan]⏳ Timer partito: {formatta_durata(secondi)}[/]")
+        console.print(t(f"[cyan]⏳ Timer partito: {formatta_durata(secondi)}[/]", f"[cyan]⏳ Timer started: {formatta_durata(secondi)}[/]"))
 
     thread = threading.Thread(target=avvisa_dopo, args=(messaggio_finale, secondi), daemon=True)
     thread.start()
@@ -372,7 +457,12 @@ def interpreta_data(testo):
             return datetime.datetime.strptime(testo, "%d/%m/%Y")
         elif testo.count("/") == 1:
             anno_corrente = datetime.datetime.now().year
-            return datetime.datetime.strptime(f"{testo}/{anno_corrente}", "%d/%m/%Y")
+            data = datetime.datetime.strptime(f"{testo}/{anno_corrente}", "%d/%m/%Y")
+            # Senza anno, una data già passata si riferisce normalmente al
+            # prossimo appuntamento (es. "10/01" inserito a luglio).
+            if data.date() < datetime.date.today():
+                data = data.replace(year=anno_corrente + 1)
+            return data
     except ValueError:
         return None
     return None
@@ -553,6 +643,10 @@ def avvia_pomodoro(comando):
     else:
         minuti_studio, minuti_pausa = 25, 5
 
+    if not (1 <= minuti_studio <= MAX_MINUTI_POMODORO and 1 <= minuti_pausa <= MAX_MINUTI_POMODORO):
+        console.print(f"[red]Scegli durate comprese tra 1 e {MAX_MINUTI_POMODORO} minuti.[/]")
+        return
+
     STOP_STUDIO.clear()
     console.print(
         f"[cyan]📚 Pomodoro avviato: {minuti_studio} min di studio / {minuti_pausa} min di pausa. "
@@ -608,10 +702,15 @@ def stampa_streaming_ollama(corpo_richiesta, indirizzo, chiave_testo):
         console.print()
         return risposta_completa
 
-    except Exception:
+    except urllib.error.HTTPError as errore:
+        console.print(f"\n[red]Ollama ha risposto con errore {errore.code}. Controlla il modello '{MODELLO_OLLAMA}'.[/]")
+        return None
+    except urllib.error.URLError as errore:
+        console.print(f"\n[red]Non riesco a contattare Ollama ({errore.reason}). Controlla che l'app sia aperta.[/]")
+        return None
+    except (json.JSONDecodeError, TimeoutError, OSError) as errore:
         console.print(
-            "\n[red]Non riesco a contattare Ollama. "
-            "Controlla che l'app Ollama sia aperta sul Mac e riprova.[/]"
+            f"\n[red]Errore durante la risposta di Ollama: {errore}[/]"
         )
         return None
 
@@ -632,14 +731,14 @@ def avvia_chat():
     global MODALITA_CHAT_ATTIVA, CRONOLOGIA_CHAT
     MODALITA_CHAT_ATTIVA = True
     CRONOLOGIA_CHAT = []
-    console.print("[cyan]💬 Chat con l'AI avviata: scrivi normalmente, senza bisogno di 'chiedi' davanti.[/]")
-    console.print("[dim](scrivi 'chiedi stop' per uscire dalla chat)[/]")
+    console.print(t("[cyan]💬 Chat con l'AI avviata: scrivi normalmente, senza bisogno di 'chiedi' davanti.[/]", "[cyan]💬 AI chat started: write normally, without typing 'ask' first.[/]"))
+    console.print(t("[dim](scrivi 'chiedi stop' per uscire dalla chat)[/]", "[dim](type 'ask stop' to leave the chat)[/]"))
 
 
 def ferma_chat():
     global MODALITA_CHAT_ATTIVA
     MODALITA_CHAT_ATTIVA = False
-    console.print("[cyan]Chat terminata, sei tornato ai comandi normali di Jarvis.[/]")
+    console.print(t("[cyan]Chat terminata, sei tornato ai comandi normali di Jarvis.[/]", "[cyan]Chat ended; you're back to Jarvis's normal commands.[/]"))
 
 
 def invia_messaggio_chat(testo):
@@ -647,6 +746,8 @@ def invia_messaggio_chat(testo):
     if testo == "":
         return
     CRONOLOGIA_CHAT.append({"role": "user", "content": testo})
+    if len(CRONOLOGIA_CHAT) > MAX_MESSAGGI_CHAT:
+        CRONOLOGIA_CHAT = CRONOLOGIA_CHAT[-MAX_MESSAGGI_CHAT:]
     corpo_richiesta = json.dumps({
         "model": MODELLO_OLLAMA,
         "messages": CRONOLOGIA_CHAT,
@@ -665,7 +766,8 @@ def invia_messaggio_chat(testo):
 # ---------------------------------------------------------
 
 def traduci(comando):
-    resto = comando.replace("traduci", "", 1).strip()
+    parti_comando = comando.split(maxsplit=1)
+    resto = parti_comando[1].strip() if len(parti_comando) > 1 else ""
     if resto == "":
         console.print("[red]Usa: traduci <testo> oppure traduci lat/latin <testo>[/]")
         return
@@ -756,7 +858,6 @@ def mostra_aiuto():
   stop studio             -> ferma il pomodoro in corso
 
 [bold underline]🎧 Svago[/]
-  ascolta                 -> ti consiglia una canzone a caso da ascoltare
   dado                    -> tira un dado a 6 facce
   moneta                  -> lancia una moneta (testa/croce)
   calcola <espr>          -> es: calcola 5*3+2
@@ -772,12 +873,45 @@ def mostra_aiuto():
   aiuto                   -> questa lista
   esci                    -> chiude Jarvis
 """
-    console.print(Panel(testo, title=f"{NOME_ASSISTENTE} - guida", border_style="cyan"))
+    if LINGUA == "en":
+        testo = """
+[bold underline]⏱️  Time management[/]
+  timer <time> (text)      -> e.g. timer 2 min 3 sec / timer check the oven 10 min
+  tasks list/add/done       -> manages tasks without a date
+  deadline list/add/done    -> manages dated deadlines, e.g. deadline add latin test 10/07
+  countdown <name> <date>   -> days left until an event, e.g. countdown school ends 07/06/2027
+  next                      -> shows the closest deadline
 
+[bold underline]🤖 Artificial intelligence (Ollama must be open)[/]
+  ask <question>            -> asks the local AI one question
+  ask start                 -> opens a continuous AI chat
+  ask stop                  -> closes the chat and returns to normal commands
 
-# ---------------------------------------------------------
-# CICLO PRINCIPALE
-# ---------------------------------------------------------
+[bold underline]📚 School[/]
+  translate <text>          -> automatically translates Italian <-> English
+  translate lat <text>      -> translates Italian -> Latin
+  translate latin <text>    -> translates Latin -> Italian
+  study (minutes) (break)   -> pomodoro, e.g. study 20 4 (default 25 5)
+  stop study                -> stops the active pomodoro
+
+[bold underline]🎧 Fun[/]
+  dice                      -> rolls a six-sided die
+  coin                      -> flips a coin
+  calculate <expression>    -> e.g. calculate 5*3+2
+
+[bold underline]🌐 Web & system[/]
+  open <site>               -> opens youtube / roblox / github / instagram / claude / chatgpt
+  time                      -> tells you the date and time
+  battery                   -> shows your Mac's battery
+  screenshot                -> takes a screenshot and saves it to the Desktop
+
+[bold underline]⚙️  General[/]
+  status                    -> tells you how long Jarvis has been running
+  help                      -> this list
+  exit                      -> closes Jarvis
+"""
+    console.print(Panel(testo, title=t(f"{NOME_ASSISTENTE} - guida", f"{NOME_ASSISTENTE} - guide"), border_style="cyan"))
+
 
 # ---------------------------------------------------------
 # CICLO PRINCIPALE
@@ -786,41 +920,40 @@ def mostra_aiuto():
 def esegui_comando(comando):
     # esegue un comando "conosciuto" da Jarvis. Ritorna True se l'ha capito,
     # False se non corrisponde a nessun comando esistente
-    if comando == "ora":
+    comando_normale = comando.lower()
+    if comando_normale == "ora":
         dimmi_ora()
-    elif comando.startswith("apri"):
+    elif comando_normale == "apri" or comando_normale.startswith("apri "):
         apri_sito(comando)
-    elif comando.startswith("calcola"):
+    elif comando_normale == "calcola" or comando_normale.startswith("calcola "):
         calcolatrice(comando)
-    elif comando == "ascolta":
-        ascolta_random()
-    elif comando.startswith("timer"):
+    elif comando_normale == "timer" or comando_normale.startswith("timer "):
         timer(comando)
-    elif comando == "stop studio":
+    elif comando_normale == "stop studio":
         ferma_pomodoro()
-    elif comando.startswith("studio"):
+    elif comando_normale == "studio" or comando_normale.startswith("studio "):
         avvia_pomodoro(comando)
-    elif comando.startswith("compiti"):
+    elif comando_normale == "compiti" or comando_normale.startswith("compiti "):
         gestisci_compiti(comando)
-    elif comando.startswith("scadenza"):
+    elif comando_normale == "scadenza" or comando_normale.startswith("scadenza "):
         gestisci_scadenze(comando)
-    elif comando.startswith("countdown"):
+    elif comando_normale == "countdown" or comando_normale.startswith("countdown "):
         countdown(comando)
-    elif comando == "prossima":
+    elif comando_normale == "prossima":
         prossima_scadenza()
-    elif comando.startswith("traduci"):
+    elif comando_normale == "traduci" or comando_normale.startswith("traduci "):
         traduci(comando)
-    elif comando == "dado":
+    elif comando_normale == "dado":
         tira_dado()
-    elif comando == "moneta":
+    elif comando_normale == "moneta":
         lancia_moneta()
-    elif comando == "batteria":
+    elif comando_normale == "batteria":
         mostra_batteria()
-    elif comando == "screenshot":
+    elif comando_normale == "screenshot":
         fai_screenshot()
-    elif comando == "stato":
+    elif comando_normale == "stato":
         mostra_stato()
-    elif comando in ("aiuto", "help"):
+    elif comando_normale in ("aiuto", "help"):
         mostra_aiuto()
     else:
         return False
@@ -828,41 +961,51 @@ def esegui_comando(comando):
 
 
 def main():
-    os.system("clear")
+    subprocess.run(["clear"], check=False)
+    scegli_lingua()
     pulisci_log_se_troppo_grande()
     mostra_banner()
     saluta()
-    console.print("[dim](scrivi 'aiuto' in qualsiasi momento per vedere i comandi)[/]")
+    console.print(t("[dim](scrivi 'aiuto' in qualsiasi momento per vedere i comandi)[/]", "[dim](type 'help' at any time to see the commands)[/]"))
 
     while True:
-        comando = console.input("\n[bold yellow]>> [/]").strip().lower()
+        comando = console.input("\n[bold yellow]>> [/]").strip()
+        comando = normalizza_comando_inglese(comando)
+        comando_normale = comando.lower()
 
         if comando == "":
             continue
 
-        scrivi_nel_log(comando)
+        e_chat = MODALITA_CHAT_ATTIVA or comando_normale == "chiedi" or comando_normale.startswith("chiedi ")
+        testo_log = comando if REGISTRA_CONTENUTO_CHAT or not e_chat else "[contenuto chat non registrato]"
+        scrivi_nel_log(testo_log)
 
         # se siamo in modalità chat, tutto quello che scrivi (tranne uscire)
         # viene mandato direttamente all'AI, senza bisogno di scrivere "chiedi"
-        if MODALITA_CHAT_ATTIVA and comando not in ("chiedi stop", "esci", "exit", "quit"):
+        if MODALITA_CHAT_ATTIVA and comando_normale not in ("chiedi stop", "esci", "exit", "quit"):
             invia_messaggio_chat(comando)
             continue
 
-        if comando in ("esci", "exit", "quit"):
-            console.print("[cyan]A dopo, Lore. 👋[/]")
+        if comando_normale in ("esci", "exit", "quit"):
+            console.print(t("[cyan]A dopo, Lore. 👋[/]", "[cyan]See you later, Lore. 👋[/]"))
             break
-        elif comando == "chiedi start":
+        elif comando_normale == "chiedi start":
             avvia_chat()
-        elif comando == "chiedi stop":
+        elif comando_normale == "chiedi stop":
             ferma_chat()
-        elif comando.startswith("chiedi"):
-            chiedi_domanda_singola(comando.replace("chiedi", "", 1).strip())
+        elif comando_normale == "chiedi" or comando_normale.startswith("chiedi "):
+            parti_comando = comando.split(maxsplit=1)
+            chiedi_domanda_singola(parti_comando[1] if len(parti_comando) > 1 else "")
         else:
             capito = esegui_comando(comando)
             if not capito:
                 console.print(
-                    "[red]Non ho capito. Scrivi 'aiuto' per la lista comandi, "
-                    "oppure 'chiedi <domanda>' per farmi una domanda vera.[/]"
+                    t(
+                        "[red]Non ho capito. Scrivi 'aiuto' per la lista comandi, "
+                        "oppure 'chiedi <domanda>' per farmi una domanda vera.[/]",
+                        "[red]I didn't understand. Type 'help' for the command list, "
+                        "or 'ask <question>' to ask me a real question.[/]",
+                    )
                 )
 
 
