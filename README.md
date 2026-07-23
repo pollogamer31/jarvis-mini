@@ -37,34 +37,6 @@ python jarvis.py
 
 From there, you can use the available commands (timer, todo, pomodoro, chat, etc.) directly from the terminal menu.
 
-> 🇮🇹 **Note: all commands are in Italian.** Here's a quick translation guide to get started:
->
-> | Italian command | Meaning |
-> |---|---|
-> | `aiuto` | help — shows the full command list |
-> | `timer <tempo>` | timer, e.g. `timer 5 min` |
-> | `studio (min) (pausa)` | pomodoro, e.g. `studio 20 4` |
-> | `stop studio` | stop the pomodoro |
-> | `compiti lista/aggiungi/fatto` | todo list / add / mark done |
-> | `scadenza lista/aggiungi/fatto` | deadlines list / add / mark done |
-> | `countdown <nome> <data>` | countdown to a date |
-> | `prossima` | shows the next upcoming deadline |
-> | `traduci <testo>` | translate (auto IT↔EN) |
-> | `traduci lat/latin <testo>` | translate to/from Latin |
-> | `chiedi <domanda>` | ask the local AI a question |
-> | `chiedi start` / `chiedi stop` | start / stop a continuous AI chat |
-> | `apri <sito>` | open a website (youtube, github, etc.) |
-> | `ascolta` | random song recommendation |
-> | `dado` / `moneta` | roll a die / flip a coin |
-> | `calcola <espr>` | calculator, e.g. `calcola 5*3+2` |
-> | `ora` | current date and time |
-> | `batteria` | battery status |
-> | `screenshot` | take a screenshot |
-> | `stato` | uptime |
-> | `esci` | quit |
->
-> A fully English version is planned for a future update.
-
 ## 🛠️ Built with
 
 - Python 3
